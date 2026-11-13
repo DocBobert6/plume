@@ -37,10 +37,10 @@ namespace plume {
 #if defined(_WIN64)
     // Native HWND handle to the target window.
     typedef HWND RenderWindow;
-#elif defined(__ANDROID__)
-    typedef ANativeWindow* RenderWindow;
 #elif defined(PLUME_SDL_VULKAN_ENABLED)
     typedef SDL_Window *RenderWindow;
+#elif defined(__ANDROID__)
+    typedef ANativeWindow* RenderWindow;
 #elif defined(__linux__)
     struct RenderWindow {
         Display* display;
@@ -1155,6 +1155,17 @@ namespace plume {
         // [wcw hdr] Requested color space; falls back to SRGB_NONLINEAR when the display path doesn't
         // support it (see RenderSwapChain::getColorSpace).
         RenderSwapChainColorSpace colorSpace = RenderSwapChainColorSpace::SRGB_NONLINEAR;
+
+#if defined(__ANDROID__)
+        // When set, the swapchain surface is created from this ANativeWindow*
+        // instead of renderWindow. Used for auxiliary displays (e.g. an
+        // android.app.Presentation surface) which cannot be SDL windows since
+        // SDL on Android is single-window. The caller owns the window
+        // reference and must keep it alive for the swapchain's lifetime.
+        void *androidNativeWindow = nullptr;
+        uint32_t androidNativeWindowWidth = 0;
+        uint32_t androidNativeWindowHeight = 0;
+#endif
 
         // The capability for presentWait must be supported by the RenderDevice.
         bool enablePresentWait = false;

@@ -41,6 +41,12 @@
 #pragma clang diagnostic pop
 #endif
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+// Marks the Android window surface as ready/lost. Called from the app's
+// activity lifecycle handling; consumed by the Vulkan swap chain.
+extern "C" void plume_set_android_surface_ready(int ready);
+#endif
+
 namespace plume {
     struct VulkanCommandQueue;
     struct VulkanDevice;
@@ -123,6 +129,9 @@ namespace plume {
         std::vector<uint32_t> descriptorIndexBases;
         std::vector<uint32_t> descriptorBindingIndices;
         VulkanDevice *device = nullptr;
+        // Set when the layout was created with VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT.
+        // The pool a set is allocated from must carry the matching flag or the allocation fails.
+        bool updateAfterBindPool = false;
 
         VulkanDescriptorSetLayout(VulkanDevice *device, const RenderDescriptorSetDesc &descriptorSetDesc);
         ~VulkanDescriptorSetLayout();
@@ -218,7 +227,7 @@ namespace plume {
         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
         void setDescriptor(uint32_t descriptorIndex, const VkDescriptorBufferInfo *bufferInfo, const VkDescriptorImageInfo *imageInfo, const VkBufferView *texelBufferView, void *pNext);
-        static VkDescriptorPool createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool lastRangeIsBoundless);
+        static VkDescriptorPool createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool updateAfterBindPool);
     };
 
     struct VulkanSwapChain : RenderSwapChain {
@@ -226,6 +235,9 @@ namespace plume {
         VkSwapchainKHR vk = VK_NULL_HANDLE;
         VulkanCommandQueue *commandQueue = nullptr;
         VkSurfaceKHR surface = VK_NULL_HANDLE;
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        uint64_t androidSurfaceGeneration = 0;
+#endif
 #if defined(__APPLE__)
         std::unique_ptr<CocoaWindow> windowWrapper;
 #endif
@@ -261,6 +273,9 @@ namespace plume {
         uint32_t getRefreshRate() const override;
         RenderSwapChainColorSpace getColorSpace() const override;
         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        bool recreateAndroidSurfaceIfNeeded();
+#endif
         void releaseSwapChain();
         void releaseImageViews();
     };
@@ -303,6 +318,9 @@ namespace plume {
         const VulkanPipelineLayout *activeComputePipelineLayout = nullptr;
         const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
         const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
+        bool activeComputePipelineValid = true;
+        bool activeGraphicsPipelineValid = true;
+        bool activeRaytracingPipelineValid = true;
         VkRenderPass activeRenderPass = VK_NULL_HANDLE;
 
         VulkanCommandList(VulkanCommandQueue *queue);
@@ -416,6 +434,13 @@ namespace plume {
         RenderDeviceDescription description;
         VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties = {};
         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
+#   if defined(__ANDROID__)
+        // Descriptor indexing feature bits and update-after-bind limits, retained so the
+        // fixed-size descriptor path can decide whether it is allowed to use
+        // UPDATE_AFTER_BIND. Only meaningful when capabilities.descriptorIndexing is true.
+        VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeatures = {};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptorIndexingProperties = {};
+#   endif
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
         bool nullDescriptorSupported = false;

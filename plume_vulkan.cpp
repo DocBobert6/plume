@@ -11,9 +11,24 @@
 #include "plume_vulkan.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdarg>
 #include <cmath>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <unordered_map>
+
+#if defined(__ANDROID__) && defined(NOMERCY_ANDROID_ADRENOTOOLS)
+#   include <android/log.h>
+#   include <dlfcn.h>
+#   include <adrenotools/driver.h>
+#   include <adrenotools/priv.h>
+#endif
 
 #if DLSS_ENABLED
 #   include "render/plume_dlss.h"
@@ -27,7 +42,114 @@
 // TODO:
 // - Fix resource pools.
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+namespace {
+    // Upper bound on how long plume_set_android_surface_ready(0) blocks while waiting for
+    // the render thread to leave the Vulkan calls that touch the window surface.
+    // surfaceDestroyed() runs on the UI thread, so overrunning this budget would ANR the
+    // app; past the deadline the setter logs and returns exactly like it always did.
+    constexpr int AndroidSurfaceDrainTimeoutMs = 500;
+
+    std::atomic_bool androidSurfaceReady{false};
+    std::atomic<uint64_t> androidSurfaceGeneration{0};
+
+    // Number of render-thread scopes currently inside a call that touches the Android
+    // window (Vulkan surface/swap chain entry points and ANativeWindow queries). The
+    // counter is global on purpose: the main and auxiliary display swap chains share the
+    // ready flag, so a single drain has to cover both of them.
+    std::atomic<uint32_t> androidSurfaceUseCount{0};
+    std::atomic<uint32_t> androidSurfaceDrainWaiters{0};
+    std::mutex androidSurfaceDrainMutex;
+    std::condition_variable androidSurfaceDrainCondition;
+
+    bool isAndroidSurfaceReady() {
+        return androidSurfaceReady.load(std::memory_order_acquire);
+    }
+
+    uint64_t getAndroidSurfaceGeneration() {
+        return androidSurfaceGeneration.load(std::memory_order_acquire);
+    }
+
+    // RAII marker for a region that may call into Vulkan (or ANativeWindow) with the
+    // Android surface. Users increment the counter before they read the ready flag and
+    // the setter clears the ready flag before it reads the counter, so under sequential
+    // consistency at least one of the two sees the other: either the user bails out, or
+    // the setter waits for it. The marker never blocks the render thread.
+    struct AndroidSurfaceUseGuard {
+        AndroidSurfaceUseGuard() {
+            androidSurfaceUseCount.fetch_add(1, std::memory_order_seq_cst);
+        }
+
+        ~AndroidSurfaceUseGuard() {
+            release();
+        }
+
+        AndroidSurfaceUseGuard(const AndroidSurfaceUseGuard &) = delete;
+        AndroidSurfaceUseGuard &operator=(const AndroidSurfaceUseGuard &) = delete;
+
+        void release() {
+            if (!active) {
+                return;
+            }
+
+            active = false;
+            if (androidSurfaceUseCount.fetch_sub(1, std::memory_order_seq_cst) != 1) {
+                return;
+            }
+
+            if (androidSurfaceDrainWaiters.load(std::memory_order_seq_cst) == 0) {
+                return;
+            }
+
+            // Taking the mutex is what closes the window against a waiter that already
+            // evaluated the predicate but has not gone to sleep yet.
+            const std::scoped_lock drainLock(androidSurfaceDrainMutex);
+            androidSurfaceDrainCondition.notify_all();
+        }
+
+        bool active = true;
+    };
+}
+
+extern "C" void plume_set_android_surface_ready(int ready) {
+    const bool newReady = ready != 0;
+    const bool oldReady = androidSurfaceReady.exchange(newReady, std::memory_order_seq_cst);
+    if (newReady) {
+        if (!oldReady) {
+            androidSurfaceGeneration.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        return;
+    }
+
+    // The flag is already cleared above, so every gated call site bails from here on.
+    // Wait for the ones that got past the gate before the clear to come back out, because
+    // Android requires all use of the window to have stopped before surfaceDestroyed()
+    // returns. This only ever blocks the caller (the UI thread); the render thread never
+    // waits on it, so the handshake cannot deadlock.
+    androidSurfaceDrainWaiters.fetch_add(1, std::memory_order_seq_cst);
+
+    bool drained = false;
+    {
+        std::unique_lock<std::mutex> drainLock(androidSurfaceDrainMutex);
+        drained = androidSurfaceDrainCondition.wait_for(drainLock, std::chrono::milliseconds(AndroidSurfaceDrainTimeoutMs), []() {
+            return androidSurfaceUseCount.load(std::memory_order_seq_cst) == 0;
+        });
+    }
+
+    androidSurfaceDrainWaiters.fetch_sub(1, std::memory_order_seq_cst);
+
+    if (!drained) {
+        // Returning here is exactly what this function did before the handshake existed.
+        // Blocking any longer would trade a rare driver complaint for a guaranteed ANR.
+        fprintf(stderr, "plume_set_android_surface_ready timed out after %d ms with %u Android surface user(s) still active; proceeding anyway.\n",
+            AndroidSurfaceDrainTimeoutMs, androidSurfaceUseCount.load(std::memory_order_relaxed));
+    }
+}
+#endif
+
 namespace plume {
+
     // Backend constants.
 
     // Required buffer alignment for acceleration structures.
@@ -41,13 +163,84 @@ namespace plume {
     // so they're not under the limit set by the the device or the backend.
     static const uint32_t MaxQueuesPerFamilyCount = 4;
 
+    static const uint32_t VulkanVendorQualcomm = 0x5143;
+    static const uint32_t VulkanVendorArm = 0x13B5;
+
+#if defined(__ANDROID__) && defined(NOMERCY_ANDROID_ADRENOTOOLS)
+    static void *AndroidCustomVulkanHandle = nullptr;
+
+    void logAndroidVulkanDriver(android_LogPriority priority, const char *format, ...) {
+        va_list args;
+        va_start(args, format);
+
+        va_list logcatArgs;
+        va_copy(logcatArgs, args);
+        __android_log_vprint(priority, "NoMercyVulkanDriver", format, logcatArgs);
+        va_end(logcatArgs);
+
+        fprintf(stderr, "[NoMercyVulkanDriver] ");
+        vfprintf(stderr, format, args);
+        fprintf(stderr, "\n");
+
+        va_end(args);
+    }
+
+    VkResult initializeVulkanLoader() {
+        const char *customDriverDir = std::getenv("APP_CUSTOM_VULKAN_DRIVER_DIR");
+        const char *customDriverName = std::getenv("APP_CUSTOM_VULKAN_DRIVER_NAME");
+        const char *nativeLibraryDir = std::getenv("APP_NATIVE_LIBRARY_DIR");
+        if (customDriverDir == nullptr || customDriverDir[0] == '\0' ||
+            customDriverName == nullptr || customDriverName[0] == '\0' ||
+            nativeLibraryDir == nullptr || nativeLibraryDir[0] == '\0') {
+            logAndroidVulkanDriver(ANDROID_LOG_INFO,
+                "Custom Vulkan driver inactive: dir=%s name=%s nativeLibDir=%s",
+                customDriverDir != nullptr ? customDriverDir : "<null>",
+                customDriverName != nullptr ? customDriverName : "<null>",
+                nativeLibraryDir != nullptr ? nativeLibraryDir : "<null>");
+            return volkInitialize();
+        }
+
+        logAndroidVulkanDriver(ANDROID_LOG_INFO,
+            "Opening custom Vulkan driver dir=%s name=%s nativeLibDir=%s",
+            customDriverDir, customDriverName, nativeLibraryDir);
+        AndroidCustomVulkanHandle = adrenotools_open_libvulkan(
+            RTLD_NOW | RTLD_LOCAL,
+            ADRENOTOOLS_DRIVER_CUSTOM,
+            nullptr,
+            nativeLibraryDir,
+            customDriverDir,
+            customDriverName,
+            nullptr,
+            nullptr);
+
+        if (AndroidCustomVulkanHandle == nullptr) {
+            logAndroidVulkanDriver(ANDROID_LOG_WARN,
+                "AdrenoTools failed to open custom Vulkan driver; falling back to system driver");
+            return volkInitialize();
+        }
+
+        auto getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(AndroidCustomVulkanHandle, "vkGetInstanceProcAddr"));
+        if (getInstanceProcAddr == nullptr) {
+            logAndroidVulkanDriver(ANDROID_LOG_WARN,
+                "Custom Vulkan driver has no vkGetInstanceProcAddr; falling back to system driver");
+            AndroidCustomVulkanHandle = nullptr;
+            return volkInitialize();
+        }
+
+        volkInitializeCustom(getInstanceProcAddr);
+        logAndroidVulkanDriver(ANDROID_LOG_INFO, "Custom Vulkan driver loaded");
+        return VK_SUCCESS;
+    }
+#else
+    VkResult initializeVulkanLoader() {
+        return volkInitialize();
+    }
+#endif
+
     // Required extensions.
 
     static const std::unordered_set<std::string> RequiredInstanceExtensions = {
         VK_KHR_SURFACE_EXTENSION_NAME,
-#   ifdef VULKAN_OBJECT_NAMES_ENABLED
-        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
-#   endif
 #   if defined(_WIN64)
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 #   elif defined(__ANDROID__)
@@ -62,6 +255,9 @@ namespace plume {
     };
 
     static const std::unordered_set<std::string> OptionalInstanceExtensions = {
+#   ifdef VULKAN_OBJECT_NAMES_ENABLED
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+#   endif
         // [wcw hdr] Exposes the HDR (extended sRGB linear, HDR10) surface color spaces.
         VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
 #   if defined(__APPLE__)
@@ -94,6 +290,129 @@ namespace plume {
     };
 
     // Common functions.
+
+    static const char *vkResultName(VkResult result) {
+        switch (result) {
+        case VK_SUCCESS:
+            return "VK_SUCCESS";
+        case VK_NOT_READY:
+            return "VK_NOT_READY";
+        case VK_TIMEOUT:
+            return "VK_TIMEOUT";
+        case VK_EVENT_SET:
+            return "VK_EVENT_SET";
+        case VK_EVENT_RESET:
+            return "VK_EVENT_RESET";
+        case VK_INCOMPLETE:
+            return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY:
+            return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+            return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED:
+            return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST:
+            return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED:
+            return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT:
+            return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+            return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT:
+            return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS:
+            return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED:
+            return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL:
+            return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_UNKNOWN:
+            return "VK_ERROR_UNKNOWN";
+        case VK_ERROR_OUT_OF_POOL_MEMORY:
+            return "VK_ERROR_OUT_OF_POOL_MEMORY";
+        case VK_ERROR_INVALID_EXTERNAL_HANDLE:
+            return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+        case VK_ERROR_FRAGMENTATION:
+            return "VK_ERROR_FRAGMENTATION";
+        case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS:
+            return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+        case VK_ERROR_SURFACE_LOST_KHR:
+            return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+            return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_SUBOPTIMAL_KHR:
+            return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            return "VK_ERROR_OUT_OF_DATE_KHR";
+        case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR:
+            return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+        case VK_ERROR_VALIDATION_FAILED_EXT:
+            return "VK_ERROR_VALIDATION_FAILED_EXT";
+        default:
+            return "VK_RESULT_UNKNOWN";
+        }
+    }
+
+    static const char *vkDeviceTypeName(VkPhysicalDeviceType type) {
+        switch (type) {
+        case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+            return "OTHER";
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return "INTEGRATED_GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return "DISCRETE_GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return "VIRTUAL_GPU";
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:
+            return "CPU";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
+    static bool vulkanDeviceNameContains(const VkPhysicalDeviceProperties &properties, const char *needle) {
+        return std::string(properties.deviceName).find(needle) != std::string::npos;
+    }
+
+    static std::string VulkanDeviceDiagnostics;
+
+    static void appendVulkanDeviceDiagnostic(const char *format, ...) {
+        char message[2048];
+
+        va_list args;
+        va_start(args, format);
+        vsnprintf(message, sizeof(message), format, args);
+        va_end(args);
+
+        fprintf(stderr, "%s", message);
+        VulkanDeviceDiagnostics += message;
+    }
+
+    static void writeVulkanDeviceDiagnosticFile(const char *reason) {
+        const char *appFolderPath = std::getenv("APP_FOLDER_PATH");
+        if ((appFolderPath == nullptr) || (appFolderPath[0] == '\0')) {
+            return;
+        }
+
+        const std::string outputPath = std::string(appFolderPath) + "/vulkan_device_error.txt";
+        FILE *file = fopen(outputPath.c_str(), "w");
+        if (file == nullptr) {
+            fprintf(stderr, "Failed to write Vulkan device diagnostic file: %s.\n", outputPath.c_str());
+            return;
+        }
+
+        fprintf(file, "No Mercy Recompiled Android Vulkan device error\n\n");
+        fprintf(file, "Reason: %s\n\n", reason);
+        fprintf(file, "%s", VulkanDeviceDiagnostics.c_str());
+        fclose(file);
+    }
+
+    static void logVulkanApiVersion(const char *prefix, uint32_t version) {
+        appendVulkanDeviceDiagnostic("%s%u.%u.%u\n", prefix, VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version), VK_VERSION_PATCH(version));
+    }
 
     static uint32_t roundUp(uint32_t value, uint32_t powerOf2Alignment) {
         return (value + powerOf2Alignment - 1) & ~(powerOf2Alignment - 1);
@@ -774,6 +1093,12 @@ namespace plume {
 
     static void setObjectName(VkDevice device, VkObjectType objectType, uint64_t object, const std::string &name) {
 #   ifdef VULKAN_OBJECT_NAMES_ENABLED
+        // VK_EXT_debug_utils is optional; the pointer is null when the
+        // instance was created without it.
+        if (vkSetDebugUtilsObjectNameEXT == nullptr) {
+            return;
+        }
+
         VkDebugUtilsObjectNameInfoEXT nameInfo = {};
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.objectType = objectType;
@@ -1146,6 +1471,115 @@ namespace plume {
 
     // VulkanDescriptorSetLayout
 
+#if defined(__ANDROID__)
+    // Android does not take the boundless descriptor path (mobile drivers choke on huge
+    // variable-count arrays), so its texture cache set is a plain fixed-size array. That
+    // array is only partially written and RT64 keeps rewriting descriptors in sets that
+    // are already recorded into command buffers that have not retired yet, both of which
+    // are only legal with PARTIALLY_BOUND and UPDATE_AFTER_BIND. The helpers below decide
+    // whether the device actually allows those bits; when anything is missing the caller
+    // builds the layout and pool exactly as it did before.
+    static bool descriptorTypeSupportsUpdateAfterBind(VkDescriptorType type, const VkPhysicalDeviceDescriptorIndexingFeatures &features) {
+        switch (type) {
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            return features.descriptorBindingSampledImageUpdateAfterBind;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            return features.descriptorBindingStorageImageUpdateAfterBind;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            return features.descriptorBindingUniformTexelBufferUpdateAfterBind;
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            return features.descriptorBindingStorageTexelBufferUpdateAfterBind;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            return features.descriptorBindingUniformBufferUpdateAfterBind;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            return features.descriptorBindingStorageBufferUpdateAfterBind;
+        default:
+            // Input attachments and the dynamic buffer types can never be updated after
+            // bind. Acceleration structures could be, but their update-after-bind limit
+            // lives in a different property struct that is not queried here, so they are
+            // treated as unsupported; Android builds do not use them anyway.
+            return false;
+        }
+    }
+
+    // Must stay a pure function of the device and the descriptor set description: the
+    // descriptor set and the pipeline layout each build their own copy of the layout from
+    // the same description, and the two are only compatible if they agree on the create
+    // flags and the binding flags.
+    static bool descriptorSetSupportsUpdateAfterBind(const VulkanDevice *device, const RenderDescriptorSetDesc &desc) {
+        // capabilities.descriptorIndexing is what chained the feature struct into
+        // vkCreateDevice. Without it none of the bits below were actually enabled.
+        if (!device->capabilities.descriptorIndexing || (desc.descriptorRangesCount == 0) || (desc.descriptorRanges == nullptr)) {
+            return false;
+        }
+
+        const VkPhysicalDeviceDescriptorIndexingFeatures &features = device->descriptorIndexingFeatures;
+        if (!features.descriptorBindingPartiallyBound) {
+            return false;
+        }
+
+        // Update-after-bind descriptors are counted against a separate set of limits, so
+        // the whole set has to fit inside them before the flags can be used.
+        uint64_t samplerCount = 0;
+        uint64_t uniformBufferCount = 0;
+        uint64_t storageBufferCount = 0;
+        uint64_t sampledImageCount = 0;
+        uint64_t storageImageCount = 0;
+        for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
+            const RenderDescriptorRange &range = desc.descriptorRanges[i];
+            const VkDescriptorType type = toVk(range.type);
+            if (!descriptorTypeSupportsUpdateAfterBind(type, features)) {
+                return false;
+            }
+
+            const uint64_t count = range.count;
+            switch (type) {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+                samplerCount += count;
+                break;
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                samplerCount += count;
+                sampledImageCount += count;
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                sampledImageCount += count;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                storageImageCount += count;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                uniformBufferCount += count;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                storageBufferCount += count;
+                break;
+            default:
+                return false;
+            }
+        }
+
+        // Every binding is created with VK_SHADER_STAGE_ALL, so the per-stage totals are
+        // the same as the per-set totals.
+        const VkPhysicalDeviceDescriptorIndexingProperties &properties = device->descriptorIndexingProperties;
+        const uint64_t resourceCount = uniformBufferCount + storageBufferCount + sampledImageCount + storageImageCount;
+        return (samplerCount <= properties.maxPerStageDescriptorUpdateAfterBindSamplers) &&
+            (uniformBufferCount <= properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers) &&
+            (storageBufferCount <= properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers) &&
+            (sampledImageCount <= properties.maxPerStageDescriptorUpdateAfterBindSampledImages) &&
+            (storageImageCount <= properties.maxPerStageDescriptorUpdateAfterBindStorageImages) &&
+            (resourceCount <= properties.maxPerStageUpdateAfterBindResources) &&
+            (samplerCount <= properties.maxDescriptorSetUpdateAfterBindSamplers) &&
+            (uniformBufferCount <= properties.maxDescriptorSetUpdateAfterBindUniformBuffers) &&
+            (storageBufferCount <= properties.maxDescriptorSetUpdateAfterBindStorageBuffers) &&
+            (sampledImageCount <= properties.maxDescriptorSetUpdateAfterBindSampledImages) &&
+            (storageImageCount <= properties.maxDescriptorSetUpdateAfterBindStorageImages);
+    }
+#endif
+
     VulkanDescriptorSetLayout::VulkanDescriptorSetLayout(VulkanDevice *device, const RenderDescriptorSetDesc &descriptorSetDesc) {
         assert(device != nullptr);
 
@@ -1208,8 +1642,26 @@ namespace plume {
 
             setLayoutInfo.pNext = &flagsInfo;
             setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+            updateAfterBindPool = true;
         }
-        
+#   if defined(__ANDROID__)
+        else if (descriptorSetSupportsUpdateAfterBind(device, descriptorSetDesc)) {
+            // Fixed-size path. VARIABLE_DESCRIPTOR_COUNT is deliberately left out: it is
+            // only valid on the last binding of a variable-sized array and would change
+            // how the set is sized, while this path allocates the full declared count.
+            bindingFlags.clear();
+            bindingFlags.resize(descriptorSetDesc.descriptorRangesCount, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+
+            flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+            flagsInfo.pBindingFlags = bindingFlags.data();
+            flagsInfo.bindingCount = uint32_t(bindingFlags.size());
+
+            setLayoutInfo.pNext = &flagsInfo;
+            setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+            updateAfterBindPool = true;
+        }
+#   endif
+
         VkResult res = vkCreateDescriptorSetLayout(device->vk, &setLayoutInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateDescriptorSetLayout failed with error code 0x%X.\n", res);
@@ -1394,7 +1846,14 @@ namespace plume {
 
         VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+            fprintf(stderr,
+                "vkCreateComputePipelines failed with error code 0x%X entry=%s workgroups=%ux%ux%u specConstants=%u.\n",
+                res,
+                stageInfo.pName != nullptr ? stageInfo.pName : "<null>",
+                desc.threadGroupSizeX,
+                desc.threadGroupSizeY,
+                desc.threadGroupSizeZ,
+                desc.specConstantsCount);
             return;
         }
     }
@@ -1406,6 +1865,10 @@ namespace plume {
     }
 
     void VulkanComputePipeline::setName(const std::string &name) {
+        if (vk == VK_NULL_HANDLE) {
+            return;
+        }
+
         setObjectName(device->vk, VK_OBJECT_TYPE_PIPELINE, uint64_t(vk), name);
     }
 
@@ -1653,7 +2116,13 @@ namespace plume {
 
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+            fprintf(stderr,
+                "vkCreateGraphicsPipelines failed with error code 0x%X stages=%u renderTargets=%u depth=%d sampleCount=0x%X.\n",
+                res,
+                pipelineInfo.stageCount,
+                desc.renderTargetCount,
+                desc.depthTargetFormat != RenderFormat::UNKNOWN,
+                uint32_t(desc.multisampling.sampleCount));
             return;
         }
     }
@@ -1669,6 +2138,10 @@ namespace plume {
     }
 
     void VulkanGraphicsPipeline::setName(const std::string &name) {
+        if (vk == VK_NULL_HANDLE) {
+            return;
+        }
+
         setObjectName(device->vk, VK_OBJECT_TYPE_PIPELINE, uint64_t(vk), name);
     }
 
@@ -1859,7 +2332,12 @@ namespace plume {
 
         VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, nullptr, nullptr, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateRayTracingPipelinesKHR failed with error code 0x%X.\n", res);
+            fprintf(stderr,
+                "vkCreateRayTracingPipelinesKHR failed with error code 0x%X stages=%u groups=%u recursion=%u.\n",
+                res,
+                pipelineInfo.stageCount,
+                pipelineInfo.groupCount,
+                pipelineInfo.maxPipelineRayRecursionDepth);
             return;
         }
 
@@ -1873,6 +2351,10 @@ namespace plume {
     }
 
     void VulkanRaytracingPipeline::setName(const std::string &name) {
+        if (vk == VK_NULL_HANDLE) {
+            return;
+        }
+
         setObjectName(device->vk, VK_OBJECT_TYPE_PIPELINE, uint64_t(vk), name);
     }
 
@@ -1912,7 +2394,10 @@ namespace plume {
 
         setLayout = new VulkanDescriptorSetLayout(device, desc);
 
-        descriptorPool = createDescriptorPool(device, typeCounts, desc.lastRangeIsBoundless);
+        // The pool flag has to mirror what the layout was actually created with, or the
+        // allocation below fails. On every non-Android build this is exactly
+        // desc.lastRangeIsBoundless, which is what was passed here before.
+        descriptorPool = createDescriptorPool(device, typeCounts, setLayout->updateAfterBindPool);
         if (descriptorPool == VK_NULL_HANDLE) {
             return;
         }
@@ -2041,7 +2526,7 @@ namespace plume {
         vkUpdateDescriptorSets(device->vk, 1, &writeDescriptor, 0, nullptr);
     }
 
-    VkDescriptorPool VulkanDescriptorSet::createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool lastRangeIsBoundless) {
+    VkDescriptorPool VulkanDescriptorSet::createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool updateAfterBindPool) {
         thread_local std::vector<VkDescriptorPoolSize> poolSizes;
         poolSizes.clear();
 
@@ -2059,7 +2544,7 @@ namespace plume {
         poolInfo.pPoolSizes = !poolSizes.empty() ? poolSizes.data() : nullptr;
         poolInfo.poolSizeCount = uint32_t(poolSizes.size());
 
-        if (lastRangeIsBoundless) {
+        if (updateAfterBindPool) {
             poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         }
 
@@ -2099,11 +2584,31 @@ namespace plume {
         }
 #   elif defined(PLUME_SDL_VULKAN_ENABLED)
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
-        SDL_bool sdlRes = SDL_Vulkan_CreateSurface(desc.renderWindow, renderInterface->instance, &surface);
-        if (sdlRes == SDL_FALSE) {
-            fprintf(stderr, "SDL_Vulkan_CreateSurface failed with error %s.\n", SDL_GetError());
-            return;
+#       if defined(__ANDROID__)
+        if (desc.androidNativeWindow != nullptr) {
+            // Auxiliary display surface from a raw ANativeWindow (SDL on
+            // Android is single-window; a Presentation surface can't be SDL's).
+            VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
+            surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+            surfaceCreateInfo.window = static_cast<ANativeWindow *>(desc.androidNativeWindow);
+            res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vkCreateAndroidSurfaceKHR failed with error code 0x%X.\n", res);
+                return;
+            }
         }
+        else
+#       endif
+        {
+            SDL_bool sdlRes = SDL_Vulkan_CreateSurface(desc.renderWindow, renderInterface->instance, &surface);
+            if (sdlRes == SDL_FALSE) {
+                fprintf(stderr, "SDL_Vulkan_CreateSurface failed with error %s.\n", SDL_GetError());
+                return;
+            }
+        }
+#       if defined(__ANDROID__)
+        androidSurfaceGeneration = getAndroidSurfaceGeneration();
+#       endif
 #   elif defined(__ANDROID__)
         assert(desc.renderWindow != nullptr);
         VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
@@ -2164,23 +2669,10 @@ namespace plume {
         VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &surfaceCapabilities);
 
-        // Pick an alpha compositing mode
-        if (surfaceCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
-            pickedAlphaFlag = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        }
-        else if (surfaceCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
-            pickedAlphaFlag = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-        }
-        else {
-            fprintf(stderr, "No known supported alpha compositing mode\n");
-            return;
-        }
-
-        // Make sure maxImageCount is never below minImageCount, as it's allowed to be zero.
-        surfaceCapabilities.maxImageCount = std::max(surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
-
-        // Clamp the requested buffer count between the bounds of the surface capabilities.
-        this->desc.textureCount = std::clamp(desc.textureCount, surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
+        const uint32_t maxImageCount = surfaceCapabilities.maxImageCount != 0
+            ? surfaceCapabilities.maxImageCount
+            : std::max(desc.textureCount, surfaceCapabilities.minImageCount);
+        this->desc.textureCount = std::clamp(desc.textureCount, surfaceCapabilities.minImageCount, maxImageCount);
 
         uint32_t surfaceFormatCount = 0;
         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &surfaceFormatCount, nullptr);
@@ -2203,6 +2695,31 @@ namespace plume {
             if (surfaceFormats[i].format == requestedFormat) {
                 compatibleSurfaceFormats.emplace_back(surfaceFormats[i]);
             }
+        }
+
+        if (compatibleSurfaceFormats.empty()) {
+            const VkFormat androidFallbackFormats[] = {
+                VK_FORMAT_B8G8R8A8_UNORM,
+                VK_FORMAT_R8G8B8A8_UNORM,
+                VK_FORMAT_B8G8R8A8_SRGB,
+                VK_FORMAT_R8G8B8A8_SRGB,
+            };
+
+            for (VkFormat fallbackFormat : androidFallbackFormats) {
+                for (uint32_t i = 0; i < surfaceFormatCount; i++) {
+                    if (surfaceFormats[i].format == fallbackFormat) {
+                        compatibleSurfaceFormats.emplace_back(surfaceFormats[i]);
+                    }
+                }
+
+                if (!compatibleSurfaceFormats.empty()) {
+                    break;
+                }
+            }
+        }
+
+        if (compatibleSurfaceFormats.empty() && !surfaceFormats.empty()) {
+            compatibleSurfaceFormats.emplace_back(surfaceFormats[0]);
         }
 
         if (compatibleSurfaceFormats.empty()) {
@@ -2280,7 +2797,77 @@ namespace plume {
         commandQueue->swapChains.erase(this);
     }
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+    // By the time present() is called, the caller has already submitted the work that
+    // signals these binary semaphores. Skipping the present because the Android surface
+    // went away would leave that signal with no consumer, and signalling the same binary
+    // semaphore again on the next frame is undefined. Consume the signals with an empty
+    // submission and block until it retires, so the semaphores are unsignalled (and safe
+    // to destroy) once this returns.
+    static void drainSkippedPresentSemaphores(VulkanCommandQueue *commandQueue, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
+        if ((commandQueue == nullptr) || (waitSemaphores == nullptr) || (waitSemaphoreCount == 0)) {
+            return;
+        }
+
+        thread_local std::vector<VkSemaphore> drainSemaphores;
+        thread_local std::vector<VkPipelineStageFlags> drainStages;
+        drainSemaphores.clear();
+        drainStages.clear();
+        for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+            drainSemaphores.emplace_back(static_cast<VulkanCommandSemaphore *>(waitSemaphores[i])->vk);
+            drainStages.emplace_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+
+        VkDevice device = commandQueue->device->vk;
+        VkFenceCreateInfo fenceCreateInfo = {};
+        fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence drainFence = VK_NULL_HANDLE;
+        VkResult res = vkCreateFence(device, &fenceCreateInfo, nullptr, &drainFence);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "vkCreateFence failed while draining a skipped present with error code 0x%X.\n", res);
+            return;
+        }
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.pWaitSemaphores = drainSemaphores.data();
+        submitInfo.waitSemaphoreCount = uint32_t(drainSemaphores.size());
+        submitInfo.pWaitDstStageMask = drainStages.data();
+
+        {
+            const std::scoped_lock queueLock(*commandQueue->queue->mutex);
+            res = vkQueueSubmit(commandQueue->queue->vk, 1, &submitInfo, drainFence);
+        }
+
+        if (res == VK_SUCCESS) {
+            // The waited-on signals were already submitted (and fence-waited) by the
+            // caller, so this submission has nothing left to block on.
+            res = vkWaitForFences(device, 1, &drainFence, VK_TRUE, UINT64_MAX);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vkWaitForFences failed while draining a skipped present with error code 0x%X.\n", res);
+            }
+        }
+        else {
+            fprintf(stderr, "vkQueueSubmit failed while draining a skipped present with error code 0x%X.\n", res);
+        }
+
+        vkDestroyFence(device, drainFence, nullptr);
+    }
+#endif
+
     bool VulkanSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // Held across vkQueuePresentKHR so surfaceDestroyed() can wait for it to finish.
+        AndroidSurfaceUseGuard androidSurfaceUse;
+        if (!isAndroidSurfaceReady() || (vk == VK_NULL_HANDLE)) {
+            // Draining the semaphores does not touch the surface and can take a fence
+            // wait, so let the surface go before doing it.
+            androidSurfaceUse.release();
+            drainSkippedPresentSemaphores(commandQueue, waitSemaphores, waitSemaphoreCount);
+            return false;
+        }
+#endif
+
         thread_local std::vector<VkSemaphore> waitSemaphoresVector;
         waitSemaphoresVector.clear();
         for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
@@ -2337,10 +2924,37 @@ namespace plume {
     }
 
     bool VulkanSwapChain::resize() {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // Covers the whole body: surface destruction/creation, swap chain creation and
+        // the ANativeWindow size queries all touch the window.
+        const AndroidSurfaceUseGuard androidSurfaceUse;
+        if (!isAndroidSurfaceReady()) {
+            releaseImageViews();
+            releaseSwapChain();
+            width = 0;
+            height = 0;
+            return false;
+        }
+
+        if (!recreateAndroidSurfaceIfNeeded()) {
+            releaseImageViews();
+            releaseSwapChain();
+            width = 0;
+            height = 0;
+            return false;
+        }
+#endif
+
         getWindowSize(width, height);
 
         // Don't recreate the swap chain at all if the window doesn't have a valid size.
         if ((width == 0) || (height == 0)) {
+#if defined(__ANDROID__)
+            // The surface is gone (activity paused); drop the swap chain so
+            // acquire/present stop touching a dead surface.
+            releaseImageViews();
+            releaseSwapChain();
+#endif
             return false;
         }
 
@@ -2351,6 +2965,45 @@ namespace plume {
         VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
 
+#if defined(__ANDROID__)
+        // Android compositors report the authoritative extent here; it can
+        // disagree with (or lag) the SDL window size.
+        if (surfaceCapabilities.currentExtent.width != UINT32_MAX) {
+            width = surfaceCapabilities.currentExtent.width;
+            height = surfaceCapabilities.currentExtent.height;
+        }
+        else {
+            width = std::clamp(width, surfaceCapabilities.minImageExtent.width, surfaceCapabilities.maxImageExtent.width);
+            height = std::clamp(height, surfaceCapabilities.minImageExtent.height, surfaceCapabilities.maxImageExtent.height);
+        }
+
+        if ((width == 0) || (height == 0)) {
+            releaseImageViews();
+            releaseSwapChain();
+            return false;
+        }
+#endif
+
+        if ((surfaceCapabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {
+            releaseImageViews();
+            releaseSwapChain();
+            return false;
+        }
+
+#if defined(__ANDROID__)
+        // Some mobile drivers don't support TRANSFER_DST/SAMPLED on swap chain images.
+        VkImageUsageFlags imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        const VkImageUsageFlags optionalImageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageUsage |= optionalImageUsage & surfaceCapabilities.supportedUsageFlags;
+#else
+        const VkImageUsageFlags imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+#endif
+
+        VkSurfaceTransformFlagBitsKHR preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        if ((surfaceCapabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) == 0) {
+            preTransform = surfaceCapabilities.currentTransform;
+        }
+
         createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.surface = surface;
         createInfo.minImageCount = desc.textureCount;
@@ -2359,9 +3012,9 @@ namespace plume {
         createInfo.imageExtent.width = width;
         createInfo.imageExtent.height = height;
         createInfo.imageArrayLayers = 1;
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        createInfo.imageUsage = imageUsage;
         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        createInfo.preTransform = preTransform;
         createInfo.compositeAlpha = pickedAlphaFlag;
         createInfo.presentMode = requiredPresentMode;
         createInfo.clipped = VK_TRUE;
@@ -2369,7 +3022,23 @@ namespace plume {
 
         VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
+            fprintf(stderr,
+                "vkCreateSwapchainKHR failed with error code 0x%X (%s). "
+                "extent=%ux%u minImages=%u format=%u colorSpace=%u usage=0x%X preTransform=0x%X compositeAlpha=0x%X presentMode=%u supportedUsage=0x%X supportedTransforms=0x%X currentTransform=0x%X.\n",
+                res,
+                vkResultName(res),
+                createInfo.imageExtent.width,
+                createInfo.imageExtent.height,
+                createInfo.minImageCount,
+                uint32_t(createInfo.imageFormat),
+                uint32_t(createInfo.imageColorSpace),
+                uint32_t(createInfo.imageUsage),
+                uint32_t(createInfo.preTransform),
+                uint32_t(createInfo.compositeAlpha),
+                uint32_t(createInfo.presentMode),
+                uint32_t(surfaceCapabilities.supportedUsageFlags),
+                uint32_t(surfaceCapabilities.supportedTransforms),
+                uint32_t(surfaceCapabilities.currentTransform));
             return false;
         }
 
@@ -2422,6 +3091,14 @@ namespace plume {
     }
 
     bool VulkanSwapChain::needsResize() const {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // getWindowSize() queries the ANativeWindow directly on the auxiliary display.
+        const AndroidSurfaceUseGuard androidSurfaceUse;
+        if (!isAndroidSurfaceReady()) {
+            return true;
+        }
+#endif
+
         uint32_t windowWidth, windowHeight;
         getWindowSize(windowWidth, windowHeight);
         return (vk == VK_NULL_HANDLE) || (windowWidth != width) || (windowHeight != height) || (requiredPresentMode != createdPresentMode);
@@ -2464,6 +3141,12 @@ namespace plume {
     }
 
     bool VulkanSwapChain::isEmpty() const {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (!isAndroidSurfaceReady()) {
+            return true;
+        }
+#endif
+
         return (vk == VK_NULL_HANDLE) || (width == 0) || (height == 0);
     }
 
@@ -2489,6 +3172,16 @@ namespace plume {
         dstWidth = rect.right - rect.left;
         dstHeight = rect.bottom - rect.top;
 #   elif defined(PLUME_SDL_VULKAN_ENABLED)
+#       if defined(__ANDROID__)
+        if (desc.androidNativeWindow != nullptr) {
+            ANativeWindow *nativeWindow = static_cast<ANativeWindow *>(desc.androidNativeWindow);
+            const int32_t nativeWidth = ANativeWindow_getWidth(nativeWindow);
+            const int32_t nativeHeight = ANativeWindow_getHeight(nativeWindow);
+            dstWidth = nativeWidth > 0 ? uint32_t(nativeWidth) : desc.androidNativeWindowWidth;
+            dstHeight = nativeHeight > 0 ? uint32_t(nativeHeight) : desc.androidNativeWindowHeight;
+            return;
+        }
+#       endif
         SDL_GetWindowSizeInPixels(desc.renderWindow, (int *)(&dstWidth), (int *)(&dstHeight));
 #   elif defined(__ANDROID__)
         dstWidth = ANativeWindow_getWidth(desc.renderWindow);
@@ -2510,6 +3203,14 @@ namespace plume {
     bool VulkanSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
         assert(signalSemaphore != nullptr);
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // Held across vkAcquireNextImageKHR, which can block on the compositor.
+        const AndroidSurfaceUseGuard androidSurfaceUse;
+        if (!isAndroidSurfaceReady() || (vk == VK_NULL_HANDLE)) {
+            return false;
+        }
+#endif
+
         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
         VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
@@ -2518,6 +3219,66 @@ namespace plume {
 
         return true;
     }
+
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+    bool VulkanSwapChain::recreateAndroidSurfaceIfNeeded() {
+        const uint64_t currentGeneration = getAndroidSurfaceGeneration();
+        if ((surface != VK_NULL_HANDLE) && (androidSurfaceGeneration == currentGeneration)) {
+            return true;
+        }
+
+        // Unlike a regular resize, this path destroys the swap chain and its surface
+        // outright instead of handing the old swap chain over to the new one, so all
+        // work referencing them must have retired first.
+        //
+        // vkDeviceWaitIdle is specified as vkQueueWaitIdle on every queue, and VkQueue
+        // is externally synchronized — so it needs the same queue lock every submit in
+        // this file takes (drainSkippedPresentSemaphores does). Without it this races
+        // the present thread on exactly the path that runs when the activity returns
+        // from a SAF picker or the background.
+        VkResult idleRes;
+        {
+            const std::scoped_lock queueLock(*commandQueue->queue->mutex);
+            idleRes = vkDeviceWaitIdle(commandQueue->device->vk);
+        }
+        if (idleRes != VK_SUCCESS) {
+            fprintf(stderr, "vkDeviceWaitIdle failed during Android surface recreation with error code 0x%X.\n", idleRes);
+            return false;
+        }
+
+        releaseImageViews();
+        releaseSwapChain();
+
+        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        if (surface != VK_NULL_HANDLE) {
+            vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
+            surface = VK_NULL_HANDLE;
+        }
+
+        if (desc.androidNativeWindow != nullptr) {
+            // Auxiliary-display swapchains recreate from their native window;
+            // the owner replaces the whole swapchain when the window changes.
+            VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
+            surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+            surfaceCreateInfo.window = static_cast<ANativeWindow *>(desc.androidNativeWindow);
+            VkResult res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vkCreateAndroidSurfaceKHR failed during Android surface recreation with error code 0x%X.\n", res);
+                return false;
+            }
+        }
+        else {
+            SDL_bool sdlRes = SDL_Vulkan_CreateSurface(desc.renderWindow, renderInterface->instance, &surface);
+            if (sdlRes == SDL_FALSE) {
+                fprintf(stderr, "SDL_Vulkan_CreateSurface failed during Android surface recreation with error %s.\n", SDL_GetError());
+                return false;
+            }
+        }
+
+        androidSurfaceGeneration = currentGeneration;
+        return true;
+    }
+#endif
 
     void VulkanSwapChain::releaseSwapChain() {
         if (vk != VK_NULL_HANDLE) {
@@ -2818,6 +3579,10 @@ namespace plume {
     }
 
     void VulkanCommandList::begin() {
+        activeComputePipelineValid = true;
+        activeGraphicsPipelineValid = true;
+        activeRaytracingPipelineValid = true;
+
         vkResetCommandBuffer(vk, 0);
 
         VkCommandBufferBeginInfo beginInfo = {};
@@ -2844,6 +3609,9 @@ namespace plume {
         activeComputePipelineLayout = nullptr;
         activeGraphicsPipelineLayout = nullptr;
         activeRaytracingPipelineLayout = nullptr;
+        activeComputePipelineValid = true;
+        activeGraphicsPipelineValid = true;
+        activeRaytracingPipelineValid = true;
     }
 
     void VulkanCommandList::barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) {
@@ -2913,6 +3681,10 @@ namespace plume {
     void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
         assert(activeComputePipelineLayout != nullptr);
 
+        if (!activeComputePipelineValid) {
+            return;
+        }
+
         vkCmdDispatch(vk, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
     }
 
@@ -2921,6 +3693,10 @@ namespace plume {
         assert(interfaceBuffer != nullptr);
         assert((interfaceBuffer->desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) && "Buffer must allow being used as a shader binding table.");
         assert(activeRaytracingPipelineLayout != nullptr);
+
+        if (!activeRaytracingPipelineValid) {
+            return;
+        }
 
         VkBufferDeviceAddressInfo tableAddressInfo = {};
         tableAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
@@ -2952,6 +3728,10 @@ namespace plume {
 
     void VulkanCommandList::drawInstanced(uint32_t vertexCountPerInstance, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation) {
         assert(activeGraphicsPipelineLayout != nullptr);
+        if (!activeGraphicsPipelineValid) {
+            return;
+        }
+
         checkActiveRenderPass();
 
         vkCmdDraw(vk, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
@@ -2959,6 +3739,10 @@ namespace plume {
     
     void VulkanCommandList::drawIndexedInstanced(uint32_t indexCountPerInstance, uint32_t instanceCount, uint32_t startIndexLocation, int32_t baseVertexLocation, uint32_t startInstanceLocation) {
         assert(activeGraphicsPipelineLayout != nullptr);
+        if (!activeGraphicsPipelineValid) {
+            return;
+        }
+
         checkActiveRenderPass();
 
         vkCmdDrawIndexed(vk, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
@@ -2971,16 +3755,31 @@ namespace plume {
         switch (interfacePipeline->type) {
         case VulkanPipeline::Type::Compute: {
             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+            activeComputePipelineValid = computePipeline->vk != VK_NULL_HANDLE;
+            if (!activeComputePipelineValid) {
+                break;
+            }
+
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Graphics: {
             const VulkanGraphicsPipeline *graphicsPipeline = static_cast<const VulkanGraphicsPipeline *>(interfacePipeline);
+            activeGraphicsPipelineValid = graphicsPipeline->vk != VK_NULL_HANDLE;
+            if (!activeGraphicsPipelineValid) {
+                break;
+            }
+
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Raytracing: {
             const VulkanRaytracingPipeline *raytracingPipeline = static_cast<const VulkanRaytracingPipeline *>(interfacePipeline);
+            activeRaytracingPipelineValid = raytracingPipeline->vk != VK_NULL_HANDLE;
+            if (!activeRaytracingPipelineValid) {
+                break;
+            }
+
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, raytracingPipeline->vk);
             break;
         }
@@ -3763,11 +4562,13 @@ namespace plume {
         assert(renderInterface != nullptr);
 
         this->renderInterface = renderInterface;
+        VulkanDeviceDiagnostics.clear();
 
         uint32_t deviceCount = 0;
         vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, nullptr);
         if (deviceCount == 0) {
-            fprintf(stderr, "Unable to find devices that support Vulkan.\n");
+            appendVulkanDeviceDiagnostic("Unable to find devices that support Vulkan.\n");
+            writeVulkanDeviceDiagnosticFile("No Vulkan physical devices were reported by the driver.");
             return;
         }
         
@@ -3786,6 +4587,14 @@ namespace plume {
         for (uint32_t i = 0; i < deviceCount; i++) {
             VkPhysicalDeviceProperties deviceProperties;
             vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
+            appendVulkanDeviceDiagnostic("Vulkan physical device %u: \"%s\", vendor=0x%X, device=0x%X, type=%s, driver=0x%X.\n",
+                i,
+                deviceProperties.deviceName,
+                deviceProperties.vendorID,
+                deviceProperties.deviceID,
+                vkDeviceTypeName(deviceProperties.deviceType),
+                deviceProperties.driverVersion);
+            logVulkanApiVersion("Vulkan physical device API version: ", deviceProperties.apiVersion);
 
             uint32_t deviceTypeIndex = deviceProperties.deviceType;
             if (deviceTypeIndex > 4) {
@@ -3812,9 +4621,33 @@ namespace plume {
         }
 
         if (physicalDevice == VK_NULL_HANDLE) {
-            fprintf(stderr, "Unable to find a device with the required features.\n");
+            appendVulkanDeviceDiagnostic("Unable to find a device with the required features.\n");
+            writeVulkanDeviceDiagnosticFile("No physical device survived Plume device selection.");
             return;
         }
+
+        // Store properties.
+        vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+
+#   ifdef __ANDROID__
+        const bool androidAdrenoDevice = (physicalDeviceProperties.vendorID == VulkanVendorQualcomm) || vulkanDeviceNameContains(physicalDeviceProperties, "Adreno");
+        const bool androidMaliDevice = (physicalDeviceProperties.vendorID == VulkanVendorArm) || vulkanDeviceNameContains(physicalDeviceProperties, "Mali");
+        const bool androidConservativeVulkan = !androidAdrenoDevice;
+        const bool androidDisplayTimingSupported = false;
+        if (androidAdrenoDevice) {
+            appendVulkanDeviceDiagnostic("Android Vulkan profile: Adreno/default.\n");
+        }
+        else if (androidMaliDevice) {
+            appendVulkanDeviceDiagnostic("Android Vulkan profile: Mali/conservative optional features.\n");
+        }
+        else {
+            appendVulkanDeviceDiagnostic("Android Vulkan profile: non-Adreno/conservative optional features.\n");
+        }
+        appendVulkanDeviceDiagnostic("Android Vulkan display timing disabled.\n");
+#   else
+        const bool androidConservativeVulkan = false;
+        const bool androidDisplayTimingSupported = true;
+#   endif
 
         // Check for extensions.
         uint32_t extensionCount;
@@ -3842,29 +4675,30 @@ namespace plume {
 #       endif
         }
         
+        const bool vulkan12Core = (VK_VERSION_MAJOR(physicalDeviceProperties.apiVersion) > 1) || ((VK_VERSION_MAJOR(physicalDeviceProperties.apiVersion) == 1) && (VK_VERSION_MINOR(physicalDeviceProperties.apiVersion) >= 2));
+
         if (!missingRequiredExtensions.empty()) {
             for (const std::string &extension : missingRequiredExtensions) {
-                fprintf(stderr, "Missing required extension: %s.\n", extension.c_str());
+                appendVulkanDeviceDiagnostic("Missing required extension: %s.\n", extension.c_str());
             }
 
-            fprintf(stderr, "Unable to create device. Required extensions are missing.\n");
+            appendVulkanDeviceDiagnostic("Unable to create device. Required extensions are missing.\n");
+            writeVulkanDeviceDiagnosticFile("Required Vulkan device extensions are missing.");
             return;
         }
-
-        // Store properties.
-        vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
 
         // Check for supported features.
         void *featuresChain = nullptr;
         VkPhysicalDeviceDescriptorIndexingFeatures indexingFeatures = {};
-        const bool descriptorIndexingFound = supportedOptionalExtensions.find(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        const bool descriptorIndexingFound = vulkan12Core || (supportedOptionalExtensions.find(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) != supportedOptionalExtensions.end());
         if (descriptorIndexingFound) {
             indexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+            indexingFeatures.pNext = featuresChain;
             featuresChain = &indexingFeatures;
         }
 
         VkPhysicalDeviceScalarBlockLayoutFeatures layoutFeatures = {};
-        const bool scalarBlockLayoutFound = supportedOptionalExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        const bool scalarBlockLayoutFound = vulkan12Core || (supportedOptionalExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) != supportedOptionalExtensions.end());
         if (scalarBlockLayoutFound) {
             layoutFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES;
             layoutFeatures.pNext = featuresChain;
@@ -3893,7 +4727,7 @@ namespace plume {
         }
 
         VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures = {};
-        const bool bufferDeviceAddressFound = supportedOptionalExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        const bool bufferDeviceAddressFound = vulkan12Core || (supportedOptionalExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) != supportedOptionalExtensions.end());
         if (bufferDeviceAddressFound) {
             bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
             bufferDeviceAddressFeatures.pNext = featuresChain;
@@ -3925,6 +4759,11 @@ namespace plume {
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
+        appendVulkanDeviceDiagnostic("Vulkan selected device: \"%s\".\n", physicalDeviceProperties.deviceName);
+        appendVulkanDeviceDiagnostic("Vulkan feature scalarBlockLayout=%u.\n", layoutFeatures.scalarBlockLayout);
+        appendVulkanDeviceDiagnostic("Vulkan feature descriptorBindingPartiallyBound=%u.\n", indexingFeatures.descriptorBindingPartiallyBound);
+        appendVulkanDeviceDiagnostic("Vulkan feature descriptorBindingVariableDescriptorCount=%u.\n", indexingFeatures.descriptorBindingVariableDescriptorCount);
+        appendVulkanDeviceDiagnostic("Vulkan feature runtimeDescriptorArray=%u.\n", indexingFeatures.runtimeDescriptorArray);
 
         // Check for properties.
         if (rayTracingFound) {
@@ -3936,7 +4775,26 @@ namespace plume {
             vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
         }
 
-        const bool sampleLocationsFound = supportedOptionalExtensions.find(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) != supportedOptionalExtensions.end();
+#   if defined(__ANDROID__)
+        // Retained for the fixed-size descriptor path, which has to know whether it may
+        // opt into UPDATE_AFTER_BIND. The feature struct is copied before the device
+        // creation chain rewrites its pNext, and it is only meaningful once
+        // capabilities.descriptorIndexing is set below (that is what actually chains the
+        // struct into vkCreateDevice and therefore enables the bits).
+        descriptorIndexingFeatures = indexingFeatures;
+        descriptorIndexingFeatures.pNext = nullptr;
+
+        if (descriptorIndexingFound) {
+            descriptorIndexingProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+
+            VkPhysicalDeviceProperties2 deviceProperties2 = {};
+            deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            deviceProperties2.pNext = &descriptorIndexingProperties;
+            vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
+        }
+#   endif
+
+        const bool sampleLocationsFound = !androidConservativeVulkan && (supportedOptionalExtensions.find(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) != supportedOptionalExtensions.end());
         if (sampleLocationsFound) {
             sampleLocationProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT;
 
@@ -3969,7 +4827,7 @@ namespace plume {
             createDeviceChain = &layoutFeatures;
         }
 
-        const bool presentWaitSupported = presentIdFeatures.presentId && presentWaitFeatures.presentWait;
+        const bool presentWaitSupported = !androidConservativeVulkan && presentIdFeatures.presentId && presentWaitFeatures.presentWait;
         if (presentWaitSupported) {
             presentIdFeatures.pNext = createDeviceChain;
             createDeviceChain = &presentIdFeatures;
@@ -4003,16 +4861,33 @@ namespace plume {
         std::vector<bool> queueFamilyUsed(queueFamilyCount, false);
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilyProperties.data());
 
+        appendVulkanDeviceDiagnostic("Vulkan queue family count: %u.\n", queueFamilyCount);
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            appendVulkanDeviceDiagnostic("Vulkan queue family %u: flags=0x%X, count=%u.\n", i, queueFamilyProperties[i].queueFlags, queueFamilyProperties[i].queueCount);
+        }
+
+        auto queueFamilySupportsFlags = [](VkQueueFlags queueFlags, VkQueueFlags requiredFlags) {
+            VkQueueFlags effectiveQueueFlags = queueFlags;
+            if ((effectiveQueueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0) {
+                effectiveQueueFlags |= VK_QUEUE_TRANSFER_BIT;
+            }
+
+            return (effectiveQueueFlags & requiredFlags) == requiredFlags;
+        };
+
         auto pickFamilyQueue = [&](RenderCommandListType type, VkQueueFlags flags) {
             uint32_t familyIndex = 0;
             uint32_t familySetBits = sizeof(uint32_t) * 8;
             uint32_t familyQueueCount = 0;
             bool familyUsed = false;
+            bool foundFamily = false;
             for (uint32_t i = 0; i < queueFamilyCount; i++) {
                 const VkQueueFamilyProperties &props = queueFamilyProperties[i];
 
                 // The family queue flags must contain all the flags required by the command list type.
-                if ((props.queueFlags & flags) != flags) {
+                // Vulkan guarantees transfer support for graphics and compute queues even if the transfer
+                // bit is not explicitly reported, which is common on some Android drivers.
+                if (!queueFamilySupportsFlags(props.queueFlags, flags)) {
                     continue;
                 }
 
@@ -4025,17 +4900,28 @@ namespace plume {
                     familySetBits = setBits;
                     familyQueueCount = props.queueCount;
                     familyUsed = used;
+                    foundFamily = true;
                 }
+            }
+
+            if (!foundFamily) {
+                appendVulkanDeviceDiagnostic("Unable to find Vulkan queue family for command list type %u with flags 0x%X.\n", uint32_t(type), flags);
+                return false;
             }
 
             queueFamilyIndices[toFamilyIndex(type)] = familyIndex;
             queueFamilyUsed[familyIndex] = true;
+            return true;
         };
 
         // Pick the family queues for each type of command list.
-        pickFamilyQueue(RenderCommandListType::DIRECT, VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
-        pickFamilyQueue(RenderCommandListType::COMPUTE, VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
-        pickFamilyQueue(RenderCommandListType::COPY, VK_QUEUE_TRANSFER_BIT);
+        const bool foundDirectQueue = pickFamilyQueue(RenderCommandListType::DIRECT, VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
+        const bool foundComputeQueue = pickFamilyQueue(RenderCommandListType::COMPUTE, VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
+        const bool foundCopyQueue = pickFamilyQueue(RenderCommandListType::COPY, VK_QUEUE_TRANSFER_BIT);
+        if (!foundDirectQueue || !foundComputeQueue || !foundCopyQueue) {
+            writeVulkanDeviceDiagnosticFile("Required Vulkan queue families are missing.");
+            return;
+        }
 
         // Create the struct to store the virtual queues.
         queueFamilies.resize(queueFamilyCount);
@@ -4067,16 +4953,28 @@ namespace plume {
 
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        createInfo.pNext = createDeviceChain;
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
         createInfo.queueCreateInfoCount = uint32_t(queueCreateInfos.size());
         createInfo.ppEnabledExtensionNames = enabledExtensions.data();
         createInfo.enabledExtensionCount = uint32_t(enabledExtensions.size());
+
+#   if defined(__ANDROID__)
+        // On Android, always use the pNext chain for features if possible to avoid issues with some drivers.
+        VkPhysicalDeviceFeatures2 enabledFeatures2 = {};
+        enabledFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        enabledFeatures2.features = deviceFeatures.features;
+        enabledFeatures2.pNext = createDeviceChain;
+        createInfo.pNext = &enabledFeatures2;
+        createInfo.pEnabledFeatures = nullptr;
+#   else
+        createInfo.pNext = createDeviceChain;
         createInfo.pEnabledFeatures = &deviceFeatures.features;
+#   endif
 
         VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
+            appendVulkanDeviceDiagnostic("vkCreateDevice failed with error code 0x%X (%s).\n", res, vkResultName(res));
+            writeVulkanDeviceDiagnosticFile("vkCreateDevice failed.");
             return;
         }
 
@@ -4117,7 +5015,8 @@ namespace plume {
 
         res = vmaCreateAllocator(&allocatorInfo, &allocator);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vmaCreateAllocator failed with error code 0x%X.\n", res);
+            appendVulkanDeviceDiagnostic("vmaCreateAllocator failed with error code 0x%X (%s).\n", res, vkResultName(res));
+            writeVulkanDeviceDiagnosticFile("Vulkan memory allocator creation failed.");
             release();
             return;
         }
@@ -4154,9 +5053,10 @@ namespace plume {
         capabilities.descriptorIndexing = descriptorIndexingSupported;
         capabilities.scalarBlockLayout = scalarBlockLayoutSupported;
         capabilities.bufferDeviceAddress = bufferDeviceAddressSupported;
-        capabilities.samplerMirrorClampToEdge = supportedOptionalExtensions.find(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        const bool vulkan13Core = (VK_VERSION_MAJOR(physicalDeviceProperties.apiVersion) > 1) || ((VK_VERSION_MAJOR(physicalDeviceProperties.apiVersion) == 1) && (VK_VERSION_MINOR(physicalDeviceProperties.apiVersion) >= 3));
+        capabilities.samplerMirrorClampToEdge = vulkan12Core || (supportedOptionalExtensions.find(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) != supportedOptionalExtensions.end());
         capabilities.presentWait = presentWaitSupported;
-        capabilities.displayTiming = supportedOptionalExtensions.find(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        capabilities.displayTiming = androidDisplayTimingSupported && !androidConservativeVulkan && (supportedOptionalExtensions.find(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) != supportedOptionalExtensions.end());
         capabilities.maxTextureSize = physicalDeviceProperties.limits.maxImageDimension2D;
         capabilities.preferHDR = memoryHeapSize > (512 * 1024 * 1024);
         capabilities.dynamicDepthBias = true;
@@ -4174,7 +5074,7 @@ namespace plume {
 #   endif
 
         // Fill Vulkan-only capabilities.
-        loadStoreOpNoneSupported = supportedOptionalExtensions.find(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        loadStoreOpNoneSupported = !androidConservativeVulkan && (vulkan13Core || (supportedOptionalExtensions.find(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME) != supportedOptionalExtensions.end()));
 
         if (!nullDescriptorSupported) {
             nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
@@ -4489,7 +5389,7 @@ namespace plume {
 #else
     VulkanInterface::VulkanInterface() {
 #endif
-        VkResult res = volkInitialize();
+        VkResult res = initializeVulkanLoader();
         if (res != VK_SUCCESS) {
             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
             return;
